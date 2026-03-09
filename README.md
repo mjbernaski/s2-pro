@@ -145,7 +145,7 @@ On a single NVIDIA H200 GPU:
 
 - [Fish Speech GitHub](https://github.com/fishaudio/fish-speech)
 - [Fish Audio Playground](https://fish.audio)
-- [Blog & Tech Report](https://fish.audio/blog/)
+- [Blog & Tech Report](https://fish.audio/blog/fish-audio-open-sources-s2/)
 
 ## License
 
