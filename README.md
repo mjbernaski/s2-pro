@@ -147,6 +147,21 @@ On a single NVIDIA H200 GPU:
 - [Fish Audio Playground](https://fish.audio)
 - [Blog & Tech Report](https://fish.audio/blog/fish-audio-open-sources-s2/)
 
+## Technical Report
+
+If you find our work useful, please consider citing our report:
+
+```bibtex
+@misc{liao2026fishaudios2technical,
+      title={Fish Audio S2 Technical Report}, 
+      author={Shijia Liao and Yuxuan Wang and Songting Liu and Yifan Cheng and Ruoyi Zhang and Tianyu Li and Shidong Li and Yisheng Zheng and Xingwei Liu and Qingzheng Wang and Zhizhuo Zhou and Jiahua Liu and Xin Chen and Dawei Han},
+      year={2026},
+      eprint={2603.08823},
+      archivePrefix={arXiv},
+      primaryClass={cs.SD},
+      url={https://arxiv.org/abs/2603.08823},
+```
+
 ## License
 
 This model is licensed under the [Fish Audio Research License](LICENSE.md). Research and non-commercial use is permitted free of charge. Commercial use requires a separate license from Fish Audio — contact business@fish.audio.
