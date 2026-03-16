@@ -13,6 +13,15 @@ import sys
 import subprocess
 import tempfile
 import time
+import platform
+
+def _play_audio(path):
+    """Play a WAV file using the platform's available player."""
+    if platform.system() == "Darwin":
+        subprocess.run(["afplay", str(path)])
+    else:
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)])
+
 
 REMOTE_HOST = "192.168.5.46"
 REMOTE_VENV = "source ~/Developer/fish/venv/bin/activate"
@@ -107,13 +116,13 @@ def main():
                 with open(save_path, "wb") as f:
                     f.write(wav_data)
                 print(f"  saved: {save_path} ({elapsed:.1f}s)")
-                subprocess.run(["afplay", save_path])
+                _play_audio(save_path)
             else:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     f.write(wav_data)
                     tmp = f.name
                 print(f"  ({elapsed:.1f}s)")
-                subprocess.run(["afplay", tmp])
+                _play_audio(tmp)
                 os.unlink(tmp)
 
             print()

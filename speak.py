@@ -20,10 +20,21 @@ import sys
 import tempfile
 import subprocess
 import time
+import platform
 from pathlib import Path
 
 MODEL_DIR = Path(__file__).parent.resolve()
 FISH_SPEECH_DIR = MODEL_DIR.parent / "fish-speech"
+
+
+def _play_audio(path):
+    """Play a WAV file using the platform's available player."""
+    if platform.system() == "Darwin":
+        subprocess.run(["afplay", str(path)])
+    elif platform.system() == "Windows":
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)])
+    else:
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)])
 
 
 # ── API mode ──────────────────────────────────────────────
@@ -34,12 +45,12 @@ def save_and_play(audio_bytes, save_path=None):
         with open(save_path, "wb") as f:
             f.write(audio_bytes)
         print(f"  saved: {save_path}")
-        subprocess.run(["afplay", str(save_path)])
+        _play_audio(save_path)
     else:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(audio_bytes)
             tmp_path = f.name
-        subprocess.run(["afplay", tmp_path])
+        _play_audio(tmp_path)
         os.unlink(tmp_path)
 
 
