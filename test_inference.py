@@ -169,16 +169,18 @@ def stage4_codec(codes, device="mps"):
 
     from fish_speech.models.text2semantic.inference import load_codec_model
 
-    precision = torch.bfloat16
-    codec = load_codec_model(str(codec_path), device, precision)
-    print(f"  Codec loaded in {time.time() - t0:.1f}s")
+    # Use CPU for codec — avoids NVRTC issues on newer GPUs
+    codec_device = "cpu"
+    precision = torch.float32 if codec_device == "cpu" else torch.bfloat16
+    codec = load_codec_model(str(codec_path), codec_device, precision)
+    print(f"  Codec loaded in {time.time() - t0:.1f}s (device: {codec_device})")
     print(f"  Sample rate: {codec.sample_rate}")
 
     # Decode
     print("  Decoding to audio...")
     from fish_speech.models.text2semantic.inference import decode_to_audio
 
-    codes_device = codes.to(device)
+    codes_device = codes.to(codec_device)
     audio = decode_to_audio(codes_device, codec)
     print(f"  Audio shape: {audio.shape}")
     print(f"  Duration: {audio.shape[0] / codec.sample_rate:.2f}s")
