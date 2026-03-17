@@ -491,7 +491,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div class="hint">
     Multi-speaker: <code>{Aria} Hello! {River} Hi there!</code> &nbsp;|&nbsp;
-    Tags: <code>[whisper]</code> <code>[excited]</code> &nbsp;|&nbsp; Ctrl+Enter to generate
+    Tags: <code>[whisper]</code> <code>[excited]</code> &nbsp;|&nbsp; Ctrl/Cmd+Enter to generate
   </div>
 
   <div class="tags">
@@ -804,7 +804,7 @@ async function speak() {
 }
 
 document.getElementById('text').addEventListener('keydown', function(e) {
-  if (e.ctrlKey && e.key === 'Enter') speak();
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') speak();
 });
 
 // --- Download helpers ---
