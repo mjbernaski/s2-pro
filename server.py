@@ -33,13 +33,30 @@ from typing import Optional
 
 MODEL_DIR = Path(__file__).parent.resolve()
 FISH_SPEECH_DIR = MODEL_DIR.parent / "fish-speech"
+VOICES_DIR = MODEL_DIR / "voices"
 sys.path.insert(0, str(FISH_SPEECH_DIR))
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pydantic import BaseModel
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
 import uvicorn
+
+# --- Audio Save Settings ---
+SETTINGS_FILE = MODEL_DIR / "settings.json"
+DEFAULT_SAVE_DIR = Path.home() / "Documents" / "audio-generated"
+
+def load_settings():
+    if SETTINGS_FILE.exists():
+        with open(SETTINGS_FILE, "r") as f:
+            return json.load(f)
+    return {"save_dir": str(DEFAULT_SAVE_DIR), "auto_save": True}
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=2)
+
+_settings = load_settings()
 
 # --- Speaker Registry ---
 SPEAKERS_FILE = MODEL_DIR / "speakers.json"
@@ -86,27 +103,107 @@ def save_speakers(speakers):
 _speakers = load_speakers()
 
 
-def resolve_speaker_text(text):
-    """Convert {Speaker Name} tags to <|speaker:N|> tags.
+def parse_speaker_segments(text, default_speaker=0):
+    """Parse text with {Speaker} tags into [(speaker_name, text), ...] segments.
 
-    Supports: {Alice} Hello {Bob} How are you?
-    Also passes through raw <|speaker:N|> tags unchanged.
+    Returns a list of (speaker_name, text_content) tuples.
+    speaker_name is the lowercase resolved name (e.g. "ivy", "flint").
     """
     name_to_id = {name.lower(): sid for sid, name in _speakers.items()}
+    id_to_name = {sid: name.lower() for sid, name in _speakers.items()}
 
-    def replace_match(m):
-        name = m.group(1).strip()
-        # Check by name (case-insensitive)
-        sid = name_to_id.get(name.lower())
-        if sid is not None:
-            return f"<|speaker:{sid}|>"
-        # Check if it's a raw numeric ID
-        if name.isdigit() and 0 <= int(name) < 100:
-            return f"<|speaker:{name}|>"
-        # Unknown speaker name - default to speaker 0
-        return f"<|speaker:0|>"
+    # Find all {Speaker} tags and split text around them
+    pattern = r'\{([^}]+)\}'
+    parts = re.split(pattern, text)
 
-    return re.sub(r'\{([^}]+)\}', replace_match, text)
+    segments = []
+    current_speaker = id_to_name.get(str(default_speaker), "aria")
+
+    i = 0
+    while i < len(parts):
+        if i % 2 == 0:
+            # Text part
+            content = parts[i].strip()
+            if content:
+                segments.append((current_speaker, content))
+        else:
+            # Speaker name part
+            name = parts[i].strip()
+            # Resolve to a known speaker name
+            if name.lower() in name_to_id:
+                current_speaker = name.lower()
+            elif name.isdigit() and 0 <= int(name) < 100:
+                current_speaker = id_to_name.get(name, f"voice {name}")
+            else:
+                current_speaker = name.lower()
+        i += 1
+
+    # If no segments found, return the whole text with default speaker
+    if not segments:
+        segments = [(current_speaker, text.strip())]
+
+    return segments
+
+
+# --- Voice Reference Cache ---
+_voice_cache = {}  # speaker_name_lower -> (prompt_text, prompt_tokens) or None
+
+
+def load_voice_reference(speaker_name):
+    """Load voice reference audio for a speaker from voices/<name>/ directory.
+
+    Returns (prompt_text, prompt_tokens) or (None, None) if no reference exists.
+    """
+    cache_key = speaker_name.lower()
+    if cache_key in _voice_cache:
+        return _voice_cache[cache_key]
+
+    voice_dir = VOICES_DIR / cache_key
+    if not voice_dir.exists():
+        _voice_cache[cache_key] = (None, None)
+        return None, None
+
+    # Find audio files
+    audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.opus'}
+    wav_files = [f for f in voice_dir.iterdir()
+                 if f.suffix.lower() in audio_extensions]
+    if not wav_files:
+        _voice_cache[cache_key] = (None, None)
+        return None, None
+
+    wav_file = wav_files[0]
+    lab_file = wav_file.with_suffix('.lab')
+    prompt_text = lab_file.read_text(encoding='utf-8').strip() if lab_file.exists() else ""
+
+    # Encode the reference audio to VQ tokens (codec is on CPU)
+    from fish_speech.models.text2semantic.inference import encode_audio
+    codec_device = next(_codec.parameters()).device
+    prompt_tokens = encode_audio(wav_file, _codec, codec_device)
+
+    _voice_cache[cache_key] = (prompt_text, prompt_tokens)
+    return prompt_text, prompt_tokens
+
+
+def invalidate_voice_cache(speaker_name=None):
+    """Clear cached voice references."""
+    global _voice_cache
+    if speaker_name:
+        _voice_cache.pop(speaker_name.lower(), None)
+    else:
+        _voice_cache.clear()
+
+
+def get_voice_status():
+    """Return dict of speaker names -> whether they have a voice reference."""
+    status = {}
+    for sid, name in sorted(_speakers.items(), key=lambda x: int(x[0])):
+        voice_dir = VOICES_DIR / name.lower()
+        has_voice = voice_dir.exists() and any(
+            f.suffix.lower() in {'.wav', '.mp3', '.flac', '.ogg', '.opus'}
+            for f in voice_dir.iterdir()
+        ) if voice_dir.exists() else False
+        status[sid] = {"name": name, "has_voice": has_voice}
+    return status
 
 
 class TTSRequest(BaseModel):
@@ -157,49 +254,81 @@ def load_models():
 
 def generate_audio(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
     import torch
+    import numpy as np
     import soundfile as sf
     from fish_speech.models.text2semantic.inference import (
         generate_long,
         decode_to_audio,
     )
 
-    # Resolve {Speaker Name} tags to <|speaker:N|> tags
-    text = resolve_speaker_text(text)
+    # Parse text into per-speaker segments
+    segments = parse_speaker_segments(text, default_speaker=speaker)
 
-    # If no speaker tag present, prepend default
-    if not text.strip().startswith("<|speaker:"):
-        text = f"<|speaker:{speaker}|>{text}"
+    # Group consecutive segments by same speaker to minimize generation calls
+    grouped = []
+    for spk, content in segments:
+        if grouped and grouped[-1][0] == spk:
+            grouped[-1] = (spk, grouped[-1][1] + " " + content)
+        else:
+            grouped.append((spk, content))
 
-    all_codes = []
-    for response in generate_long(
-        model=_model,
-        device=_device,
-        decode_one_token=_decode_one_token,
-        text=text,
-        num_samples=1,
-        max_new_tokens=0,
-        top_p=top_p,
-        top_k=top_k,
-        temperature=temperature,
-        compile=False,
-        iterative_prompt=True,
-        chunk_length=300,
-        prompt_text=None,
-        prompt_tokens=None,
-    ):
-        if response.action == "sample":
-            all_codes.append(response.codes)
-        elif response.action == "next":
-            break
+    all_audio_segments = []
+    silence_samples = int(_codec.sample_rate * 0.15)  # 150ms silence between speakers
 
-    if not all_codes:
+    for seg_idx, (spk_name, seg_text) in enumerate(grouped):
+        # Load voice reference for this speaker (if available)
+        prompt_text, prompt_tokens = load_voice_reference(spk_name)
+
+        # Wrap in lists if we have reference audio (as generate_long expects)
+        if prompt_tokens is not None:
+            ref_texts = [prompt_text or ""]
+            ref_tokens = [prompt_tokens]
+        else:
+            ref_texts = None
+            ref_tokens = None
+
+        # Use speaker 0 tag (identity comes from reference audio, not the tag)
+        tagged_text = f"<|speaker:0|>{seg_text}"
+
+        seg_codes = []
+        for response in generate_long(
+            model=_model,
+            device=_device,
+            decode_one_token=_decode_one_token,
+            text=tagged_text,
+            num_samples=1,
+            max_new_tokens=0,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            compile=False,
+            iterative_prompt=True,
+            chunk_length=300,
+            prompt_text=ref_texts,
+            prompt_tokens=ref_tokens,
+        ):
+            if response.action == "sample":
+                seg_codes.append(response.codes)
+            elif response.action == "next":
+                break
+
+        if seg_codes:
+            codes = torch.cat(seg_codes, dim=1)
+            audio = decode_to_audio(codes.to("cpu"), _codec)
+            all_audio_segments.append(audio)
+
+            # Add silence between different speakers (not after last segment)
+            if seg_idx < len(grouped) - 1:
+                silence = torch.zeros(silence_samples)
+                all_audio_segments.append(silence)
+
+    if not all_audio_segments:
         return None
 
-    codes = torch.cat(all_codes, dim=1)
-    audio = decode_to_audio(codes.to("cpu"), _codec)
+    final_audio = torch.cat(all_audio_segments)
 
     buf = io.BytesIO()
-    sf.write(buf, audio.float().numpy(), _codec.sample_rate, format="WAV")
+    sf.write(buf, final_audio.float().numpy(), _codec.sample_rate, format="WAV")
     return buf.getvalue()
 
 
@@ -278,6 +407,55 @@ HTML_PAGE = """<!DOCTYPE html>
                            border-radius: 4px; cursor: pointer; font-size: 0.75rem;
                            padding: 4px; }
   .speaker-grid .sg-test:hover { border-color: #4a9eff; color: #aaa; }
+
+  /* Voice cloning panel */
+  .voice-panel { margin-top: 16px; border-top: 1px solid #222; padding-top: 16px; }
+  .voice-panel summary { cursor: pointer; color: #666; font-size: 0.85rem; }
+  .voice-panel summary:hover { color: #aaa; }
+  .voice-list { margin-top: 12px; }
+  .voice-item { display: flex; align-items: center; gap: 8px; padding: 6px 0;
+                border-bottom: 1px solid #1a1a1a; font-size: 0.85rem; }
+  .voice-item .vi-name { width: 100px; color: #aaa; flex-shrink: 0; }
+  .voice-item .vi-status { font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; flex-shrink: 0; }
+  .voice-item .vi-status.has-voice { background: #1a2a1a; color: #4a9; border: 1px solid #2a4a2a; }
+  .voice-item .vi-status.no-voice { background: #1a1a1a; color: #555; border: 1px solid #333; }
+  .voice-item .vi-actions { display: flex; gap: 4px; margin-left: auto; }
+  .voice-item button { background: #222; border: 1px solid #333; color: #888; border-radius: 4px;
+                       cursor: pointer; font-size: 0.75rem; padding: 3px 8px; }
+  .voice-item button:hover { border-color: #4a9eff; color: #aaa; }
+  .voice-item button.vi-delete { color: #a55; }
+  .voice-item button.vi-delete:hover { border-color: #f66; color: #f66; }
+  .voice-upload { margin-top: 12px; background: #111; border: 1px solid #222; border-radius: 8px;
+                  padding: 12px; display: none; }
+  .voice-upload label { font-size: 0.8rem; color: #888; display: block; margin-bottom: 4px; }
+  .voice-upload input[type="file"] { font-size: 0.8rem; color: #aaa; margin-bottom: 8px; }
+  .voice-upload input[type="text"] { width: 100%; background: #1a1a1a; border: 1px solid #333;
+                                     color: #e0e0e0; padding: 6px 8px; border-radius: 4px;
+                                     font-size: 0.85rem; margin-bottom: 8px; }
+  .voice-upload .vu-btns { display: flex; gap: 8px; }
+  .speaker-tag.has-voice { border-color: #2a4a2a; background: #0a1a0a; }
+  .speaker-tag.has-voice::after { content: ' \u25CF'; color: #4a9; font-size: 0.6rem; }
+
+  /* Download buttons */
+  .dl-btn { display: inline-flex; align-items: center; gap: 4px; background: #1a2a1a;
+            border: 1px solid #2a4a2a; color: #6b9; border-radius: 4px; cursor: pointer;
+            font-size: 0.75rem; padding: 3px 8px; margin-left: 4px; }
+  .dl-btn:hover { background: #2a3a2a; border-color: #4a9; color: #8dc; }
+  .dl-btn svg { width: 12px; height: 12px; fill: currentColor; }
+  .history-item .item-actions { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+
+  /* Save settings panel */
+  .save-panel { margin-top: 16px; border-top: 1px solid #222; padding-top: 16px; }
+  .save-panel summary { cursor: pointer; color: #666; font-size: 0.85rem; }
+  .save-panel summary:hover { color: #aaa; }
+  .save-settings { margin-top: 12px; }
+  .save-settings label { font-size: 0.8rem; color: #888; display: block; margin-bottom: 4px; }
+  .save-settings input[type="text"] { width: 100%; background: #1a1a1a; border: 1px solid #333;
+    color: #e0e0e0; padding: 6px 8px; border-radius: 4px; font-size: 0.85rem; margin-bottom: 8px; }
+  .save-settings .toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .save-settings .toggle input[type="checkbox"] { accent-color: #4a9eff; }
+  .save-indicator { font-size: 0.75rem; color: #4a9; padding: 2px 8px; background: #0a1a0a;
+                    border-radius: 10px; border: 1px solid #1a3a1a; }
 </style>
 </head>
 <body>
@@ -349,17 +527,63 @@ HTML_PAGE = """<!DOCTYPE html>
         Reset to Defaults</button>
     </div>
   </details>
+
+  <details class="voice-panel">
+    <summary>Voice Cloning (assign reference audio to speakers)</summary>
+    <p style="font-size:0.78rem; color:#555; margin-top:8px; line-height:1.4;">
+      Upload a short audio clip (5&ndash;15 sec) for each speaker to clone their voice.
+      Speakers with a reference clip will use voice cloning; others use the default model voice.
+    </p>
+    <div class="voice-list" id="voiceList"></div>
+    <div class="voice-upload" id="voiceUpload">
+      <label>Uploading voice for: <strong id="vuSpeakerName"></strong></label>
+      <label>Audio file (WAV, MP3, FLAC &mdash; 5-15 sec recommended)</label>
+      <input type="file" id="vuFile" accept=".wav,.mp3,.flac,.ogg,.opus">
+      <label>Transcript of the audio (helps quality)</label>
+      <input type="text" id="vuText" placeholder="What the speaker says in the clip...">
+      <div class="vu-btns">
+        <button onclick="submitVoiceUpload()" style="background:#2a6a2a; color:#ccc; padding:6px 16px;">Upload</button>
+        <button onclick="cancelVoiceUpload()" style="background:#333; color:#888; padding:6px 16px;">Cancel</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="save-panel">
+    <summary>Auto-Save Settings</summary>
+    <div class="save-settings">
+      <div class="toggle">
+        <input type="checkbox" id="autoSave" onchange="updateSaveSettings()">
+        <label for="autoSave" style="display:inline; margin:0;">Auto-save generated audio to disk</label>
+      </div>
+      <label>Save directory:</label>
+      <input type="text" id="saveDir" placeholder="Documents/audio-generated">
+      <button onclick="updateSaveSettings()" style="padding:6px 16px; font-size:0.85rem; background:#2a6a2a; color:#ccc; border:none; border-radius:4px; cursor:pointer;">
+        Save Settings</button>
+    </div>
+  </details>
 </div>
 
 <script>
 let speakers = {};
+let voiceStatus = {};
+let saveSettings = {};
 
 async function loadSpeakers() {
   const resp = await fetch('/v1/speakers');
   speakers = await resp.json();
+  await loadVoices();
+  await loadSaveSettings();
   renderSpeakerDropdown();
   renderSpeakerTags();
   renderSpeakerGrid();
+  renderVoiceList();
+}
+
+async function loadVoices() {
+  try {
+    const resp = await fetch('/v1/voices');
+    voiceStatus = await resp.json();
+  } catch(e) { voiceStatus = {}; }
 }
 
 function renderSpeakerDropdown() {
@@ -381,8 +605,10 @@ function renderSpeakerTags() {
   const entries = Object.entries(speakers).sort((a,b) => parseInt(a[0]) - parseInt(b[0]));
   for (const [id, name] of entries.slice(0, 20)) {
     const span = document.createElement('span');
-    span.className = 'speaker-tag';
+    const hasVoice = voiceStatus[id] && voiceStatus[id].has_voice;
+    span.className = 'speaker-tag' + (hasVoice ? ' has-voice' : '');
     span.textContent = name;
+    span.title = hasVoice ? name + ' (voice cloned)' : name + ' (default voice)';
     span.onclick = () => insertSpeaker(name);
     container.appendChild(span);
   }
@@ -520,9 +746,13 @@ async function speak() {
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    const savedFilename = resp.headers.get('X-Saved-Filename') || '';
 
     document.getElementById('audioContainer').innerHTML =
-      '<audio controls autoplay src="' + url + '"></audio>';
+      '<audio controls autoplay src="' + url + '"></audio>' +
+      '<button class="dl-btn" onclick="downloadBlob(\'' + url + '\', \'' + (savedFilename || 'speech.wav') + '\')">' +
+      dlIcon + ' Download</button>' +
+      (savedFilename ? ' <span class="save-indicator">Saved: ' + savedFilename + '</span>' : '');
 
     status.textContent = 'Generated in ' + elapsed + 's';
 
@@ -533,8 +763,13 @@ async function speak() {
     item.className = 'history-item';
     item.innerHTML =
       '<div class="text">' + text.replace(/</g, '&lt;') + '</div>' +
-      '<div class="meta">' + elapsed + 's &mdash; ' + new Date().toLocaleTimeString() + '</div>' +
-      '<audio controls src="' + url + '"></audio>';
+      '<div class="meta">' + elapsed + 's &mdash; ' + new Date().toLocaleTimeString() +
+      (savedFilename ? ' &mdash; ' + savedFilename : '') + '</div>' +
+      '<audio controls src="' + url + '"></audio>' +
+      '<div class="item-actions">' +
+      '<button class="dl-btn" onclick="downloadBlob(\'' + url + '\', \'' + (savedFilename || 'speech.wav') + '\')">' +
+      dlIcon + ' Download</button>' +
+      '</div>';
     historyList.insertBefore(item, historyList.firstChild);
 
   } catch (e) {
@@ -549,6 +784,159 @@ async function speak() {
 document.getElementById('text').addEventListener('keydown', function(e) {
   if (e.ctrlKey && e.key === 'Enter') speak();
 });
+
+// --- Download helpers ---
+const dlIcon = '<svg viewBox="0 0 16 16"><path d="M8 12l-4-4h2.5V2h3v6H12L8 12zm-6 2h12v1.5H2V14z"/></svg>';
+
+function downloadBlob(url, filename) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+// --- Save Settings ---
+async function loadSaveSettings() {
+  try {
+    const resp = await fetch('/v1/settings');
+    saveSettings = await resp.json();
+    document.getElementById('autoSave').checked = saveSettings.auto_save !== false;
+    document.getElementById('saveDir').value = saveSettings.save_dir || '';
+  } catch(e) {}
+}
+
+async function updateSaveSettings() {
+  const autoSave = document.getElementById('autoSave').checked;
+  const saveDir = document.getElementById('saveDir').value.trim();
+  try {
+    const resp = await fetch('/v1/settings', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ auto_save: autoSave, save_dir: saveDir || undefined })
+    });
+    if (resp.ok) {
+      saveSettings = await resp.json();
+      document.getElementById('status').textContent = 'Save settings updated!';
+    }
+  } catch(e) {
+    document.getElementById('status').textContent = 'Error updating settings';
+  }
+}
+
+// --- Voice Cloning UI ---
+let _vuSpeakerName = '';
+
+function renderVoiceList() {
+  const list = document.getElementById('voiceList');
+  list.innerHTML = '';
+  const entries = Object.entries(voiceStatus).sort((a,b) => parseInt(a[0]) - parseInt(b[0]));
+  for (const [id, info] of entries.slice(0, 20)) {
+    const item = document.createElement('div');
+    item.className = 'voice-item';
+
+    const nameDiv = document.createElement('div');
+    nameDiv.className = 'vi-name';
+    nameDiv.textContent = info.name;
+
+    const statusDiv = document.createElement('div');
+    statusDiv.className = 'vi-status ' + (info.has_voice ? 'has-voice' : 'no-voice');
+    statusDiv.textContent = info.has_voice ? 'Cloned' : 'Default';
+
+    const actions = document.createElement('div');
+    actions.className = 'vi-actions';
+
+    if (info.has_voice) {
+      const playBtn = document.createElement('button');
+      playBtn.textContent = 'Preview';
+      playBtn.onclick = () => previewVoice(info.name);
+      actions.appendChild(playBtn);
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'vi-delete';
+      delBtn.textContent = 'Remove';
+      delBtn.onclick = () => deleteVoice(info.name);
+      actions.appendChild(delBtn);
+    }
+
+    const uploadBtn = document.createElement('button');
+    uploadBtn.textContent = info.has_voice ? 'Replace' : 'Upload';
+    uploadBtn.onclick = () => showVoiceUpload(info.name);
+    actions.appendChild(uploadBtn);
+
+    item.appendChild(nameDiv);
+    item.appendChild(statusDiv);
+    item.appendChild(actions);
+    list.appendChild(item);
+  }
+}
+
+function showVoiceUpload(name) {
+  _vuSpeakerName = name;
+  document.getElementById('vuSpeakerName').textContent = name;
+  document.getElementById('vuFile').value = '';
+  document.getElementById('vuText').value = '';
+  document.getElementById('voiceUpload').style.display = 'block';
+}
+
+function cancelVoiceUpload() {
+  document.getElementById('voiceUpload').style.display = 'none';
+}
+
+async function submitVoiceUpload() {
+  const file = document.getElementById('vuFile').files[0];
+  if (!file) { alert('Please select an audio file.'); return; }
+
+  const text = document.getElementById('vuText').value.trim();
+  const formData = new FormData();
+  formData.append('audio', file);
+  formData.append('text', text);
+
+  const status = document.getElementById('status');
+  status.textContent = 'Uploading voice for ' + _vuSpeakerName + '...';
+
+  try {
+    const resp = await fetch('/v1/voices/' + encodeURIComponent(_vuSpeakerName.toLowerCase()), {
+      method: 'POST',
+      body: formData
+    });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || 'Upload failed');
+    }
+    status.textContent = 'Voice uploaded for ' + _vuSpeakerName + '!';
+    cancelVoiceUpload();
+    await loadVoices();
+    renderVoiceList();
+    renderSpeakerTags();
+  } catch(e) {
+    status.className = 'status error';
+    status.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function deleteVoice(name) {
+  if (!confirm('Remove voice reference for ' + name + '?')) return;
+  try {
+    const resp = await fetch('/v1/voices/' + encodeURIComponent(name.toLowerCase()), { method: 'DELETE' });
+    if (!resp.ok) throw new Error('Failed to delete');
+    document.getElementById('status').textContent = 'Voice removed for ' + name;
+    await loadVoices();
+    renderVoiceList();
+    renderSpeakerTags();
+  } catch(e) {
+    document.getElementById('status').className = 'status error';
+    document.getElementById('status').textContent = 'Error: ' + e.message;
+  }
+}
+
+function previewVoice(name) {
+  const url = '/v1/voices/' + encodeURIComponent(name.toLowerCase()) + '/audio';
+  document.getElementById('audioContainer').innerHTML =
+    '<audio controls autoplay src="' + url + '"></audio>';
+  document.getElementById('status').textContent = 'Playing reference for ' + name;
+}
 
 loadSpeakers();
 </script>
@@ -810,6 +1198,25 @@ async def help_page():
     return HELP_PAGE
 
 
+def _auto_save_audio(wav_bytes, text):
+    """Save audio to the configured save directory. Returns the saved filename or None."""
+    if not _settings.get("auto_save", True):
+        return None
+    save_dir = Path(_settings.get("save_dir", str(DEFAULT_SAVE_DIR)))
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate filename from timestamp and text snippet
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    # Clean text for filename: take first 40 chars, remove special chars
+    snippet = re.sub(r'[{}\[\]<>|\\/:*?"\']+', '', text[:40]).strip().replace(' ', '_')
+    if not snippet:
+        snippet = "speech"
+    filename = f"{ts}_{snippet}.wav"
+    filepath = save_dir / filename
+    filepath.write_bytes(wav_bytes)
+    return filename
+
+
 @app.post("/v1/tts")
 async def tts_api(body: TTSRequest):
     text = body.text.strip()
@@ -827,13 +1234,19 @@ async def tts_api(body: TTSRequest):
     if wav_bytes is None:
         return JSONResponse({"detail": "No audio generated"}, status_code=500)
 
-    print(f"Generated {len(wav_bytes)} bytes in {elapsed:.1f}s for: {text[:80]}")
+    # Auto-save to disk
+    saved_filename = _auto_save_audio(wav_bytes, text)
+    if saved_filename:
+        print(f"Generated {len(wav_bytes)} bytes in {elapsed:.1f}s, saved as {saved_filename}")
+    else:
+        print(f"Generated {len(wav_bytes)} bytes in {elapsed:.1f}s for: {text[:80]}")
 
     return Response(
         content=wav_bytes,
         media_type="audio/wav",
         headers={
             "X-Generation-Time": f"{elapsed:.2f}",
+            "X-Saved-Filename": saved_filename or "",
             "Content-Disposition": 'inline; filename="speech.wav"',
         },
     )
@@ -858,6 +1271,123 @@ async def reset_speakers():
     _speakers = dict(DEFAULT_SPEAKERS)
     save_speakers(_speakers)
     return JSONResponse(_speakers)
+
+
+@app.get("/v1/voices")
+async def list_voices():
+    """List all speakers and their voice reference status."""
+    return JSONResponse(get_voice_status())
+
+
+@app.post("/v1/voices/{speaker_name}")
+async def upload_voice(speaker_name: str, audio: UploadFile = File(...), text: str = Form("")):
+    """Upload a reference audio file for voice cloning."""
+    speaker_name = speaker_name.strip()
+    if not speaker_name:
+        return JSONResponse({"detail": "Speaker name is required"}, status_code=400)
+
+    # Validate audio file
+    allowed_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.opus'}
+    ext = Path(audio.filename).suffix.lower() if audio.filename else '.wav'
+    if ext not in allowed_extensions:
+        return JSONResponse({"detail": f"Unsupported format. Use: {', '.join(allowed_extensions)}"}, status_code=400)
+
+    voice_dir = VOICES_DIR / speaker_name.lower()
+    voice_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove existing audio files
+    for f in voice_dir.iterdir():
+        if f.suffix.lower() in allowed_extensions or f.suffix.lower() == '.lab':
+            f.unlink()
+
+    # Save audio file
+    audio_path = voice_dir / f"sample{ext}"
+    content = await audio.read()
+    if len(content) > 50 * 1024 * 1024:  # 50MB limit
+        return JSONResponse({"detail": "File too large (max 50MB)"}, status_code=400)
+    audio_path.write_bytes(content)
+
+    # Save transcript
+    lab_path = voice_dir / "sample.lab"
+    lab_path.write_text(text.strip(), encoding='utf-8')
+
+    # Invalidate cache for this speaker
+    invalidate_voice_cache(speaker_name)
+
+    return JSONResponse({"status": "ok", "speaker": speaker_name, "file": audio.filename})
+
+
+@app.delete("/v1/voices/{speaker_name}")
+async def delete_voice(speaker_name: str):
+    """Delete a voice reference."""
+    import shutil
+    voice_dir = VOICES_DIR / speaker_name.lower()
+    if not voice_dir.exists():
+        return JSONResponse({"detail": "Voice not found"}, status_code=404)
+
+    shutil.rmtree(voice_dir)
+    invalidate_voice_cache(speaker_name)
+    return JSONResponse({"status": "ok", "speaker": speaker_name})
+
+
+@app.get("/v1/voices/{speaker_name}/audio")
+async def get_voice_audio(speaker_name: str):
+    """Serve the reference audio file for preview."""
+    voice_dir = VOICES_DIR / speaker_name.lower()
+    if not voice_dir.exists():
+        return JSONResponse({"detail": "Voice not found"}, status_code=404)
+
+    audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.opus'}
+    for f in voice_dir.iterdir():
+        if f.suffix.lower() in audio_extensions:
+            return FileResponse(str(f), media_type="audio/wav")
+    return JSONResponse({"detail": "No audio file found"}, status_code=404)
+
+
+@app.get("/v1/settings")
+async def get_settings():
+    return JSONResponse(_settings)
+
+
+@app.put("/v1/settings")
+async def update_settings(body: dict):
+    global _settings
+    if "save_dir" in body:
+        _settings["save_dir"] = str(body["save_dir"])
+    if "auto_save" in body:
+        _settings["auto_save"] = bool(body["auto_save"])
+    save_settings(_settings)
+    return JSONResponse(_settings)
+
+
+@app.get("/v1/downloads")
+async def list_downloads():
+    """List all saved audio files."""
+    save_dir = Path(_settings.get("save_dir", str(DEFAULT_SAVE_DIR)))
+    if not save_dir.exists():
+        return JSONResponse([])
+    files = sorted(
+        [f.name for f in save_dir.iterdir() if f.suffix.lower() == '.wav'],
+        reverse=True
+    )
+    return JSONResponse(files)
+
+
+@app.get("/v1/downloads/{filename}")
+async def download_file(filename: str):
+    """Download a specific saved audio file."""
+    save_dir = Path(_settings.get("save_dir", str(DEFAULT_SAVE_DIR)))
+    filepath = save_dir / filename
+    if not filepath.exists() or not filepath.is_file():
+        return JSONResponse({"detail": "File not found"}, status_code=404)
+    # Ensure the file is within the save directory (path traversal protection)
+    if not filepath.resolve().parent == save_dir.resolve():
+        return JSONResponse({"detail": "Invalid path"}, status_code=400)
+    return FileResponse(
+        str(filepath),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/health")
