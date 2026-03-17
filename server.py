@@ -552,7 +552,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <summary>Auto-Save Settings</summary>
     <div class="save-settings">
       <div class="toggle">
-        <input type="checkbox" id="autoSave" onchange="updateSaveSettings()">
+        <input type="checkbox" id="autoSave">
         <label for="autoSave" style="display:inline; margin:0;">Auto-save generated audio to disk</label>
       </div>
       <label>Save directory:</label>
@@ -748,11 +748,21 @@ async function speak() {
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     const savedFilename = resp.headers.get('X-Saved-Filename') || '';
 
-    document.getElementById('audioContainer').innerHTML =
-      '<audio controls autoplay src="' + url + '"></audio>' +
-      '<button class="dl-btn" onclick="downloadBlob(\'' + url + '\', \'' + (savedFilename || 'speech.wav') + '\')">' +
-      dlIcon + ' Download</button>' +
-      (savedFilename ? ' <span class="save-indicator">Saved: ' + savedFilename + '</span>' : '');
+    const fname = savedFilename || 'speech.wav';
+    const container = document.getElementById('audioContainer');
+    container.innerHTML = '<audio controls autoplay src="' + url + '"></audio>';
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'dl-btn';
+    dlBtn.innerHTML = dlIcon + ' Download';
+    dlBtn.onclick = function() { downloadBlob(url, fname); };
+    container.appendChild(dlBtn);
+    if (savedFilename) {
+      const indicator = document.createElement('span');
+      indicator.className = 'save-indicator';
+      indicator.textContent = 'Saved: ' + savedFilename;
+      container.appendChild(document.createTextNode(' '));
+      container.appendChild(indicator);
+    }
 
     status.textContent = 'Generated in ' + elapsed + 's';
 
@@ -761,15 +771,27 @@ async function speak() {
     const historyList = document.getElementById('historyList');
     const item = document.createElement('div');
     item.className = 'history-item';
-    item.innerHTML =
-      '<div class="text">' + text.replace(/</g, '&lt;') + '</div>' +
-      '<div class="meta">' + elapsed + 's &mdash; ' + new Date().toLocaleTimeString() +
-      (savedFilename ? ' &mdash; ' + savedFilename : '') + '</div>' +
-      '<audio controls src="' + url + '"></audio>' +
-      '<div class="item-actions">' +
-      '<button class="dl-btn" onclick="downloadBlob(\'' + url + '\', \'' + (savedFilename || 'speech.wav') + '\')">' +
-      dlIcon + ' Download</button>' +
-      '</div>';
+    const itemText = document.createElement('div');
+    itemText.className = 'text';
+    itemText.textContent = text;
+    const itemMeta = document.createElement('div');
+    itemMeta.className = 'meta';
+    itemMeta.textContent = elapsed + 's \u2014 ' + new Date().toLocaleTimeString() +
+      (savedFilename ? ' \u2014 ' + savedFilename : '');
+    const itemAudio = document.createElement('audio');
+    itemAudio.controls = true;
+    itemAudio.src = url;
+    const itemActions = document.createElement('div');
+    itemActions.className = 'item-actions';
+    const itemDlBtn = document.createElement('button');
+    itemDlBtn.className = 'dl-btn';
+    itemDlBtn.innerHTML = dlIcon + ' Download';
+    itemDlBtn.onclick = function() { downloadBlob(url, fname); };
+    itemActions.appendChild(itemDlBtn);
+    item.appendChild(itemText);
+    item.appendChild(itemMeta);
+    item.appendChild(itemAudio);
+    item.appendChild(itemActions);
     historyList.insertBefore(item, historyList.firstChild);
 
   } catch (e) {
