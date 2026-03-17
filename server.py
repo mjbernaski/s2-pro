@@ -282,7 +282,10 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>Fish Audio S2 Pro</h1>
+  <div style="display:flex; justify-content:space-between; align-items:baseline;">
+    <h1>Fish Audio S2 Pro</h1>
+    <a href="/help" style="color:#4a9eff; font-size:0.85rem; text-decoration:none;">Help &amp; API docs</a>
+  </div>
   <p class="subtitle">Text-to-Speech &mdash; multi-speaker support</p>
 
   <textarea id="text" placeholder="{Aria} Hello there! {River} How are you today?&#10;&#10;Or just type plain text for single-speaker mode."></textarea>
@@ -553,9 +556,258 @@ loadSpeakers();
 </html>"""
 
 
+HELP_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Help &mdash; Fish Audio S2 Pro</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: #0a0a0a; color: #d0d0d0; min-height: 100vh;
+         display: flex; justify-content: center; padding: 40px 20px; line-height: 1.65; }
+  .container { max-width: 760px; width: 100%; }
+  a { color: #4a9eff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; color: #fff; }
+  .subtitle { color: #666; margin-bottom: 32px; font-size: 0.9rem; }
+  h2 { font-size: 1.15rem; color: #fff; margin: 32px 0 12px; padding-bottom: 6px;
+       border-bottom: 1px solid #222; }
+  h3 { font-size: 0.95rem; color: #ccc; margin: 20px 0 8px; }
+  p { margin-bottom: 12px; font-size: 0.92rem; }
+  code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 0.88rem;
+         color: #e8c872; font-family: 'Cascadia Code', 'Fira Code', monospace; }
+  pre { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px;
+        overflow-x: auto; margin: 12px 0 16px; font-size: 0.85rem; line-height: 1.5; }
+  pre code { background: none; padding: 0; color: #ccc; }
+  .example { background: #0d1117; border: 1px solid #1a2233; border-radius: 8px;
+             padding: 14px 16px; margin: 10px 0 16px; }
+  .example .label { font-size: 0.78rem; color: #4a9eff; text-transform: uppercase;
+                    letter-spacing: 0.5px; margin-bottom: 6px; }
+  .example code { color: #e0e0e0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 0.88rem; }
+  th { text-align: left; color: #888; font-weight: 600; padding: 8px 12px;
+       border-bottom: 1px solid #333; font-size: 0.8rem; text-transform: uppercase;
+       letter-spacing: 0.3px; }
+  td { padding: 8px 12px; border-bottom: 1px solid #1a1a1a; }
+  td code { font-size: 0.82rem; }
+  .tag-grid { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 16px; }
+  .tag-pill { background: #1a1a1a; border: 1px solid #333; padding: 4px 12px;
+              border-radius: 14px; font-size: 0.82rem; color: #aaa; }
+  .back { display: inline-block; margin-bottom: 20px; font-size: 0.85rem; }
+  .nav { display: flex; gap: 16px; margin-bottom: 24px; font-size: 0.85rem;
+         padding: 10px 0; border-bottom: 1px solid #222; }
+  .section-note { background: #1a1a0a; border-left: 3px solid #e8c872; padding: 10px 14px;
+                  margin: 12px 0; font-size: 0.85rem; color: #bbb; border-radius: 0 6px 6px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <a href="/" class="back">&larr; Back to app</a>
+  <h1>Fish Audio S2 Pro</h1>
+  <p class="subtitle">Text-to-Speech Server &mdash; Help &amp; API Reference</p>
+
+  <nav class="nav">
+    <a href="#quick-start">Quick Start</a>
+    <a href="#multi-speaker">Multi-Speaker</a>
+    <a href="#tags">Voice Tags</a>
+    <a href="#speakers">Speakers</a>
+    <a href="#api">API Reference</a>
+    <a href="#tips">Tips</a>
+  </nav>
+
+  <!-- QUICK START -->
+  <h2 id="quick-start">Quick Start</h2>
+  <p>Type text in the main text area and click <strong>Speak</strong> (or press <code>Ctrl+Enter</code>).
+     The selected default speaker will be used unless you specify speakers inline.</p>
+
+  <div class="example">
+    <div class="label">Single speaker</div>
+    <code>Hello! This is a test of the text-to-speech system.</code>
+  </div>
+
+  <div class="example">
+    <div class="label">Single speaker with emotion</div>
+    <code>[excited] Wow, this sounds amazing! [pause] Don't you think?</code>
+  </div>
+
+  <!-- MULTI-SPEAKER -->
+  <h2 id="multi-speaker">Multi-Speaker Mode</h2>
+  <p>Use curly braces with a speaker name to switch voices mid-text.
+     Each <code>{Name}</code> tag sets the voice for the text that follows it.</p>
+
+  <div class="example">
+    <div class="label">Two speakers</div>
+    <code>{Aria} Hello there! How are you doing today? {River} I'm doing great, thanks for asking!</code>
+  </div>
+
+  <div class="example">
+    <div class="label">Multi-speaker dialogue with tags</div>
+    <code>{Nova} [whisper] Did you hear that? {Sage} [excited] Yes! It was incredible! {Nova} [laughing] I know, right?</code>
+  </div>
+
+  <div class="example">
+    <div class="label">Using numeric IDs directly</div>
+    <code>{0} Hello from speaker zero. {5} And hello from speaker five.</code>
+  </div>
+
+  <div class="section-note">
+    Speaker names are case-insensitive: <code>{aria}</code>, <code>{Aria}</code>, and <code>{ARIA}</code> all work.
+    If a name isn't recognized, it falls back to speaker 0.
+  </div>
+
+  <!-- VOICE TAGS -->
+  <h2 id="tags">Voice Control Tags</h2>
+  <p>Place tags anywhere in your text to control emotion, pacing, and delivery style.
+     Tags can be combined and placed inline with the text.</p>
+
+  <h3>Common Tags</h3>
+  <div class="tag-grid">
+    <span class="tag-pill">[whisper]</span>
+    <span class="tag-pill">[excited]</span>
+    <span class="tag-pill">[laughing]</span>
+    <span class="tag-pill">[pause]</span>
+    <span class="tag-pill">[singing]</span>
+    <span class="tag-pill">[angry]</span>
+    <span class="tag-pill">[sad]</span>
+    <span class="tag-pill">[shouting]</span>
+    <span class="tag-pill">[emphasis]</span>
+    <span class="tag-pill">[low voice]</span>
+  </div>
+
+  <h3>Additional Tags</h3>
+  <div class="tag-grid">
+    <span class="tag-pill">[sigh]</span>
+    <span class="tag-pill">[gasp]</span>
+    <span class="tag-pill">[cough]</span>
+    <span class="tag-pill">[clearing throat]</span>
+    <span class="tag-pill">[sobbing]</span>
+    <span class="tag-pill">[giggling]</span>
+    <span class="tag-pill">[screaming]</span>
+    <span class="tag-pill">[whispering]</span>
+    <span class="tag-pill">[nervous]</span>
+    <span class="tag-pill">[sarcastic]</span>
+    <span class="tag-pill">[cheerful]</span>
+    <span class="tag-pill">[serious]</span>
+    <span class="tag-pill">[dramatic]</span>
+    <span class="tag-pill">[monotone]</span>
+    <span class="tag-pill">[fast]</span>
+    <span class="tag-pill">[slow]</span>
+  </div>
+
+  <div class="section-note">
+    The model was trained on 15,000+ unique tags. Experiment freely &mdash; many natural descriptions
+    work even if not listed here (e.g. <code>[tired]</code>, <code>[robotic]</code>, <code>[storytelling]</code>).
+  </div>
+
+  <!-- SPEAKERS -->
+  <h2 id="speakers">Default Speakers</h2>
+  <p>The model has 100 built-in speaker slots (IDs 0&ndash;99). The first 20 have been given
+     placeholder names. Use the <strong>Speaker Management</strong> panel on the main page to
+     rename them after you've tested what each one sounds like.</p>
+
+  <table>
+    <tr><th>ID</th><th>Default Name</th><th>ID</th><th>Default Name</th></tr>
+    <tr><td>0</td><td>Aria</td><td>10</td><td>Phoenix</td></tr>
+    <tr><td>1</td><td>River</td><td>11</td><td>Maple</td></tr>
+    <tr><td>2</td><td>Nova</td><td>12</td><td>Orion</td></tr>
+    <tr><td>3</td><td>Sage</td><td>13</td><td>Ivy</td></tr>
+    <tr><td>4</td><td>Echo</td><td>14</td><td>Flint</td></tr>
+    <tr><td>5</td><td>Luna</td><td>15</td><td>Dune</td></tr>
+    <tr><td>6</td><td>Atlas</td><td>16</td><td>Breeze</td></tr>
+    <tr><td>7</td><td>Coral</td><td>17</td><td>Cedar</td></tr>
+    <tr><td>8</td><td>Jasper</td><td>18</td><td>Pearl</td></tr>
+    <tr><td>9</td><td>Willow</td><td>19</td><td>Storm</td></tr>
+  </table>
+
+  <p>Speaker names are saved to <code>speakers.json</code> and persist across server restarts.
+     IDs 20&ndash;99 default to &ldquo;Voice N&rdquo;.</p>
+
+  <!-- API REFERENCE -->
+  <h2 id="api">API Reference</h2>
+
+  <h3>POST /v1/tts</h3>
+  <p>Generate speech from text. Returns <code>audio/wav</code>.</p>
+  <table>
+    <tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>text</code></td><td>string</td><td><em>required</em></td><td>Text to speak. Supports <code>{Name}</code> tags and <code>[emotion]</code> tags.</td></tr>
+    <tr><td><code>speaker</code></td><td>int</td><td>0</td><td>Default speaker ID (0&ndash;99). Used when no <code>{Name}</code> tag is present.</td></tr>
+    <tr><td><code>temperature</code></td><td>float</td><td>0.7</td><td>Sampling temperature (0.1&ndash;2.0). Higher = more varied.</td></tr>
+    <tr><td><code>top_p</code></td><td>float</td><td>0.9</td><td>Nucleus sampling threshold (0.1&ndash;1.0).</td></tr>
+    <tr><td><code>top_k</code></td><td>int</td><td>30</td><td>Top-K sampling limit.</td></tr>
+  </table>
+
+  <pre><code># Single speaker
+curl -X POST http://localhost:8880/v1/tts \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "Hello world!", "speaker": 0}' \\
+  -o output.wav
+
+# Multi-speaker
+curl -X POST http://localhost:8880/v1/tts \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "{Aria} Hi! {River} Hey there!"}' \\
+  -o dialogue.wav</code></pre>
+
+  <p>Response headers include <code>X-Generation-Time</code> with elapsed seconds.</p>
+
+  <h3>GET /v1/speakers</h3>
+  <p>Returns the current speaker name mapping as JSON (<code>{"0": "Aria", "1": "River", ...}</code>).</p>
+
+  <h3>PUT /v1/speakers</h3>
+  <p>Update speaker names. Send a JSON object of ID&rarr;name pairs. Returns the updated map.</p>
+  <pre><code>curl -X PUT http://localhost:8880/v1/speakers \\
+  -H "Content-Type: application/json" \\
+  -d '{"0": "Alice", "1": "Bob"}'</code></pre>
+
+  <h3>POST /v1/speakers/reset</h3>
+  <p>Reset all speaker names to defaults.</p>
+
+  <h3>GET /health</h3>
+  <p>Returns server status: <code>{"status": "ok", "model_loaded": true, "device": "cuda"}</code></p>
+
+  <!-- TIPS -->
+  <h2 id="tips">Tips &amp; Notes</h2>
+
+  <h3>Generation Parameters</h3>
+  <p><strong>Temperature</strong> controls randomness. Lower values (0.3&ndash;0.5) give more consistent,
+     predictable output. Higher values (0.8&ndash;1.2) add variety and expressiveness but may
+     introduce artifacts. The default 0.7 is a good balance.</p>
+  <p><strong>Top-P</strong> (nucleus sampling) limits the token pool. Lower values constrain output;
+     0.9 works well for most cases.</p>
+
+  <h3>Best Practices</h3>
+  <p>
+    &bull; Use punctuation naturally &mdash; commas, periods, and question marks guide pacing and intonation.<br>
+    &bull; Place <code>[pause]</code> tags for intentional breaks between sentences.<br>
+    &bull; Test speakers with the <strong>Test</strong> button in Speaker Management before using them in dialogues.<br>
+    &bull; For long texts, the model processes in chunks of ~300 bytes. Very long inputs work but take proportionally longer.<br>
+    &bull; Different speakers may respond differently to emotion tags &mdash; experiment to find the best combinations.
+  </p>
+
+  <h3>Model Details</h3>
+  <p>Fish Audio S2 Pro uses a Dual Autoregressive architecture (4B slow AR + 400M fast AR)
+     trained on 10M+ hours of audio across 80+ languages. Audio is encoded with a 10-codebook
+     RVQ codec at ~21 Hz frame rate.</p>
+
+  <div style="margin-top: 40px; padding-top: 16px; border-top: 1px solid #222;
+              font-size: 0.8rem; color: #444; text-align: center;">
+    Fish Audio S2 Pro &mdash; Local TTS Server
+  </div>
+</div>
+</body>
+</html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def web_ui():
     return HTML_PAGE
+
+
+@app.get("/help", response_class=HTMLResponse)
+async def help_page():
+    return HELP_PAGE
 
 
 @app.post("/v1/tts")
