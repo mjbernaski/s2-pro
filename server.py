@@ -13,6 +13,9 @@ API:
   Body: {"text": "Hello world", "speaker": 0, "temperature": 0.7, "top_p": 0.9, "top_k": 30}
   Returns: audio/wav
 
+  Multi-speaker:
+  Body: {"text": "{Alice} Hello! {Bob} How are you?", "temperature": 0.7}
+
 Web UI:
   GET /
 """
@@ -20,11 +23,13 @@ Web UI:
 import asyncio
 import io
 import os
+import re
 import sys
 import time
 import json
 import threading
 from pathlib import Path
+from typing import Optional
 
 MODEL_DIR = Path(__file__).parent.resolve()
 FISH_SPEECH_DIR = MODEL_DIR.parent / "fish-speech"
@@ -35,6 +40,73 @@ from pydantic import BaseModel
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 import uvicorn
+
+# --- Speaker Registry ---
+SPEAKERS_FILE = MODEL_DIR / "speakers.json"
+
+DEFAULT_SPEAKERS = {
+    "0": "Aria",
+    "1": "River",
+    "2": "Nova",
+    "3": "Sage",
+    "4": "Echo",
+    "5": "Luna",
+    "6": "Atlas",
+    "7": "Coral",
+    "8": "Jasper",
+    "9": "Willow",
+    "10": "Phoenix",
+    "11": "Maple",
+    "12": "Orion",
+    "13": "Ivy",
+    "14": "Flint",
+    "15": "Dune",
+    "16": "Breeze",
+    "17": "Cedar",
+    "18": "Pearl",
+    "19": "Storm",
+}
+# Fill remaining IDs with generic names
+for i in range(20, 100):
+    DEFAULT_SPEAKERS[str(i)] = f"Voice {i}"
+
+
+def load_speakers():
+    if SPEAKERS_FILE.exists():
+        with open(SPEAKERS_FILE, "r") as f:
+            return json.load(f)
+    return dict(DEFAULT_SPEAKERS)
+
+
+def save_speakers(speakers):
+    with open(SPEAKERS_FILE, "w") as f:
+        json.dump(speakers, f, indent=2)
+
+
+_speakers = load_speakers()
+
+
+def resolve_speaker_text(text):
+    """Convert {Speaker Name} tags to <|speaker:N|> tags.
+
+    Supports: {Alice} Hello {Bob} How are you?
+    Also passes through raw <|speaker:N|> tags unchanged.
+    """
+    name_to_id = {name.lower(): sid for sid, name in _speakers.items()}
+
+    def replace_match(m):
+        name = m.group(1).strip()
+        # Check by name (case-insensitive)
+        sid = name_to_id.get(name.lower())
+        if sid is not None:
+            return f"<|speaker:{sid}|>"
+        # Check if it's a raw numeric ID
+        if name.isdigit() and 0 <= int(name) < 100:
+            return f"<|speaker:{name}|>"
+        # Unknown speaker name - default to speaker 0
+        return f"<|speaker:0|>"
+
+    return re.sub(r'\{([^}]+)\}', replace_match, text)
 
 
 class TTSRequest(BaseModel):
@@ -91,6 +163,10 @@ def generate_audio(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
         decode_to_audio,
     )
 
+    # Resolve {Speaker Name} tags to <|speaker:N|> tags
+    text = resolve_speaker_text(text)
+
+    # If no speaker tag present, prepend default
     if not text.strip().startswith("<|speaker:"):
         text = f"<|speaker:{speaker}|>{text}"
 
@@ -138,10 +214,10 @@ HTML_PAGE = """<!DOCTYPE html>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
          background: #0a0a0a; color: #e0e0e0; min-height: 100vh;
          display: flex; justify-content: center; padding: 40px 20px; }
-  .container { max-width: 640px; width: 100%; }
+  .container { max-width: 700px; width: 100%; }
   h1 { font-size: 1.5rem; margin-bottom: 8px; color: #fff; }
   .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9rem; }
-  textarea { width: 100%; height: 120px; padding: 12px; border: 1px solid #333;
+  textarea { width: 100%; height: 140px; padding: 12px; border: 1px solid #333;
              border-radius: 8px; background: #1a1a1a; color: #e0e0e0;
              font-size: 1rem; resize: vertical; font-family: inherit; }
   textarea:focus { outline: none; border-color: #4a9eff; }
@@ -150,7 +226,9 @@ HTML_PAGE = """<!DOCTYPE html>
   .control-group label { font-size: 0.8rem; color: #888; }
   .control-group input, .control-group select {
     background: #1a1a1a; border: 1px solid #333; color: #e0e0e0;
-    padding: 6px 8px; border-radius: 4px; font-size: 0.85rem; width: 70px; }
+    padding: 6px 8px; border-radius: 4px; font-size: 0.85rem; }
+  .control-group input { width: 70px; }
+  .control-group select { width: 140px; }
   button { padding: 10px 24px; border: none; border-radius: 8px; cursor: pointer;
            font-size: 1rem; font-weight: 600; transition: all 0.2s; }
   #speakBtn { background: #4a9eff; color: #fff; }
@@ -160,31 +238,65 @@ HTML_PAGE = """<!DOCTYPE html>
   .status.error { color: #ff6b6b; }
   #audioContainer { margin-top: 16px; }
   audio { width: 100%; }
-  .tags { margin-top: 16px; font-size: 0.8rem; color: #666; }
+
+  .speaker-tags { margin-top: 12px; font-size: 0.8rem; color: #666; }
+  .speaker-tags .label { margin-bottom: 4px; }
+  .speaker-tag { display: inline-block; background: #1a1a1a; border: 1px solid #333;
+                 padding: 3px 10px; border-radius: 12px; margin: 2px; cursor: pointer;
+                 font-size: 0.8rem; }
+  .speaker-tag:hover { border-color: #4a9eff; color: #aaa; }
+  .speaker-tag.active { border-color: #4a9eff; background: #1a2a3a; color: #4a9eff; }
+
+  .tags { margin-top: 12px; font-size: 0.8rem; color: #666; }
   .tags span { display: inline-block; background: #1a1a1a; border: 1px solid #333;
                padding: 2px 8px; border-radius: 12px; margin: 2px; cursor: pointer; }
   .tags span:hover { border-color: #4a9eff; color: #aaa; }
+
   .history { margin-top: 24px; }
   .history h3 { font-size: 0.9rem; color: #888; margin-bottom: 8px; }
   .history-item { background: #1a1a1a; border: 1px solid #222; border-radius: 8px;
                   padding: 12px; margin-bottom: 8px; }
-  .history-item .text { font-size: 0.85rem; color: #aaa; margin-bottom: 8px; }
+  .history-item .text { font-size: 0.85rem; color: #aaa; margin-bottom: 8px;
+                        white-space: pre-wrap; }
   .history-item .meta { font-size: 0.75rem; color: #555; }
   .history-item audio { width: 100%; margin-top: 8px; }
+
+  .hint { margin-top: 8px; font-size: 0.78rem; color: #555; line-height: 1.5; }
+  .hint code { background: #1a1a1a; padding: 1px 5px; border-radius: 3px; color: #888; }
+
+  /* Speaker management panel */
+  .speaker-panel { margin-top: 20px; border-top: 1px solid #222; padding-top: 16px; }
+  .speaker-panel summary { cursor: pointer; color: #666; font-size: 0.85rem; }
+  .speaker-panel summary:hover { color: #aaa; }
+  .speaker-grid { display: grid; grid-template-columns: 60px 1fr 60px; gap: 4px;
+                  margin-top: 12px; max-height: 300px; overflow-y: auto; padding-right: 4px; }
+  .speaker-grid .sg-header { font-size: 0.75rem; color: #555; padding: 4px 0; }
+  .speaker-grid input { background: #1a1a1a; border: 1px solid #333; color: #e0e0e0;
+                        padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; }
+  .speaker-grid .sg-id { font-size: 0.8rem; color: #666; padding: 6px 0; }
+  .speaker-grid .sg-test { background: #222; border: 1px solid #333; color: #888;
+                           border-radius: 4px; cursor: pointer; font-size: 0.75rem;
+                           padding: 4px; }
+  .speaker-grid .sg-test:hover { border-color: #4a9eff; color: #aaa; }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>Fish Audio S2 Pro</h1>
-  <p class="subtitle">Text-to-Speech &mdash; RTX 5090 local inference</p>
+  <p class="subtitle">Text-to-Speech &mdash; multi-speaker support</p>
 
-  <textarea id="text" placeholder="Type text to speak... Use [tags] like [whisper], [excited], [laughing] for control."></textarea>
+  <textarea id="text" placeholder="{Aria} Hello there! {River} How are you today?&#10;&#10;Or just type plain text for single-speaker mode."></textarea>
+
+  <div class="speaker-tags" id="speakerTagsSection">
+    <div class="label">Insert speaker:</div>
+    <div id="speakerTags"></div>
+  </div>
 
   <div class="controls">
     <button id="speakBtn" onclick="speak()">Speak</button>
     <div class="control-group">
-      <label>Speaker</label>
-      <input type="number" id="speaker" value="0" min="0" max="99">
+      <label>Default</label>
+      <select id="speaker"></select>
     </div>
     <div class="control-group">
       <label>Temp</label>
@@ -196,8 +308,12 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="hint">
+    Multi-speaker: <code>{Aria} Hello! {River} Hi there!</code> &nbsp;|&nbsp;
+    Tags: <code>[whisper]</code> <code>[excited]</code> &nbsp;|&nbsp; Ctrl+Enter to generate
+  </div>
+
   <div class="tags">
-    Common tags:
     <span onclick="insertTag('[whisper]')">[whisper]</span>
     <span onclick="insertTag('[excited]')">[excited]</span>
     <span onclick="insertTag('[laughing]')">[laughing]</span>
@@ -217,15 +333,155 @@ HTML_PAGE = """<!DOCTYPE html>
     <h3>History</h3>
     <div id="historyList"></div>
   </div>
+
+  <details class="speaker-panel">
+    <summary>Speaker Management (rename voices)</summary>
+    <div class="speaker-grid" id="speakerGrid">
+      <div class="sg-header">ID</div><div class="sg-header">Name</div><div class="sg-header"></div>
+    </div>
+    <div style="margin-top: 8px; display: flex; gap: 8px;">
+      <button onclick="saveSpeakers()" style="padding:6px 16px; font-size:0.85rem; background:#2a6a2a; color:#ccc;">
+        Save Names</button>
+      <button onclick="resetSpeakers()" style="padding:6px 16px; font-size:0.85rem; background:#333; color:#888;">
+        Reset to Defaults</button>
+    </div>
+  </details>
 </div>
 
 <script>
+let speakers = {};
+
+async function loadSpeakers() {
+  const resp = await fetch('/v1/speakers');
+  speakers = await resp.json();
+  renderSpeakerDropdown();
+  renderSpeakerTags();
+  renderSpeakerGrid();
+}
+
+function renderSpeakerDropdown() {
+  const sel = document.getElementById('speaker');
+  sel.innerHTML = '';
+  // Show first 20 by default in dropdown
+  const entries = Object.entries(speakers).sort((a,b) => parseInt(a[0]) - parseInt(b[0]));
+  for (const [id, name] of entries.slice(0, 20)) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = name + ' (#' + id + ')';
+    sel.appendChild(opt);
+  }
+}
+
+function renderSpeakerTags() {
+  const container = document.getElementById('speakerTags');
+  container.innerHTML = '';
+  const entries = Object.entries(speakers).sort((a,b) => parseInt(a[0]) - parseInt(b[0]));
+  for (const [id, name] of entries.slice(0, 20)) {
+    const span = document.createElement('span');
+    span.className = 'speaker-tag';
+    span.textContent = name;
+    span.onclick = () => insertSpeaker(name);
+    container.appendChild(span);
+  }
+}
+
+function renderSpeakerGrid() {
+  const grid = document.getElementById('speakerGrid');
+  grid.innerHTML = '<div class="sg-header">ID</div><div class="sg-header">Name</div><div class="sg-header"></div>';
+  const entries = Object.entries(speakers).sort((a,b) => parseInt(a[0]) - parseInt(b[0]));
+  for (const [id, name] of entries.slice(0, 30)) {
+    const idDiv = document.createElement('div');
+    idDiv.className = 'sg-id';
+    idDiv.textContent = '#' + id;
+
+    const input = document.createElement('input');
+    input.value = name;
+    input.dataset.id = id;
+    input.className = 'sg-name';
+
+    const testBtn = document.createElement('button');
+    testBtn.className = 'sg-test';
+    testBtn.textContent = 'Test';
+    testBtn.onclick = () => testSpeaker(id);
+
+    grid.appendChild(idDiv);
+    grid.appendChild(input);
+    grid.appendChild(testBtn);
+  }
+}
+
+function insertSpeaker(name) {
+  const ta = document.getElementById('text');
+  const start = ta.selectionStart;
+  const tag = '{' + name + '} ';
+  ta.value = ta.value.slice(0, start) + tag + ta.value.slice(ta.selectionEnd);
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = start + tag.length;
+}
+
 function insertTag(tag) {
   const ta = document.getElementById('text');
   const start = ta.selectionStart;
   ta.value = ta.value.slice(0, start) + tag + ta.value.slice(ta.selectionEnd);
   ta.focus();
   ta.selectionStart = ta.selectionEnd = start + tag.length;
+}
+
+async function saveSpeakers() {
+  const inputs = document.querySelectorAll('.sg-name');
+  const updated = {};
+  inputs.forEach(inp => { updated[inp.dataset.id] = inp.value; });
+  // Merge with existing speakers (for IDs not shown in grid)
+  const merged = Object.assign({}, speakers, updated);
+  const resp = await fetch('/v1/speakers', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(merged)
+  });
+  if (resp.ok) {
+    speakers = await resp.json();
+    renderSpeakerDropdown();
+    renderSpeakerTags();
+    document.getElementById('status').textContent = 'Speaker names saved!';
+  }
+}
+
+async function resetSpeakers() {
+  const resp = await fetch('/v1/speakers/reset', { method: 'POST' });
+  if (resp.ok) {
+    speakers = await resp.json();
+    renderSpeakerDropdown();
+    renderSpeakerTags();
+    renderSpeakerGrid();
+    document.getElementById('status').textContent = 'Speaker names reset to defaults.';
+  }
+}
+
+async function testSpeaker(id) {
+  const name = speakers[id] || 'Voice ' + id;
+  const status = document.getElementById('status');
+  status.textContent = 'Testing ' + name + '...';
+
+  try {
+    const resp = await fetch('/v1/tts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        text: 'Hello, my name is ' + name + '. Nice to meet you!',
+        speaker: parseInt(id),
+        temperature: 0.7, top_p: 0.9
+      })
+    });
+    if (!resp.ok) throw new Error('Failed');
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    document.getElementById('audioContainer').innerHTML =
+      '<audio controls autoplay src="' + url + '"></audio>';
+    status.textContent = name + ' (#' + id + ')';
+  } catch(e) {
+    status.className = 'status error';
+    status.textContent = 'Error testing speaker';
+  }
 }
 
 async function speak() {
@@ -262,13 +518,11 @@ async function speak() {
     const url = URL.createObjectURL(blob);
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
 
-    // Main player
     document.getElementById('audioContainer').innerHTML =
       '<audio controls autoplay src="' + url + '"></audio>';
 
     status.textContent = 'Generated in ' + elapsed + 's';
 
-    // Add to history
     const historySection = document.getElementById('historySection');
     historySection.style.display = 'block';
     const historyList = document.getElementById('historyList');
@@ -292,6 +546,8 @@ async function speak() {
 document.getElementById('text').addEventListener('keydown', function(e) {
   if (e.ctrlKey && e.key === 'Enter') speak();
 });
+
+loadSpeakers();
 </script>
 </body>
 </html>"""
@@ -329,6 +585,27 @@ async def tts_api(body: TTSRequest):
             "Content-Disposition": 'inline; filename="speech.wav"',
         },
     )
+
+
+@app.get("/v1/speakers")
+async def get_speakers():
+    return JSONResponse(_speakers)
+
+
+@app.put("/v1/speakers")
+async def update_speakers(body: dict):
+    global _speakers
+    _speakers.update(body)
+    save_speakers(_speakers)
+    return JSONResponse(_speakers)
+
+
+@app.post("/v1/speakers/reset")
+async def reset_speakers():
+    global _speakers
+    _speakers = dict(DEFAULT_SPEAKERS)
+    save_speakers(_speakers)
+    return JSONResponse(_speakers)
 
 
 @app.get("/health")
