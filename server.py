@@ -261,6 +261,7 @@ class TTSRequest(BaseModel):
     top_p: float = 0.9
     top_k: int = 30
     stream: bool = False
+    chunk_size: int = 500
 
 app = FastAPI(title="Fish Audio S2 Pro TTS", version="1.0.0")
 
@@ -381,7 +382,7 @@ def generate_audio(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
     return buf.getvalue()
 
 
-def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
+def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30, chunk_size=500):
     """Generator that yields (chunk_index, total_chunks, wav_bytes) for each text chunk."""
     import torch
     import numpy as np
@@ -405,7 +406,7 @@ def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30
     # Expand each segment into text chunks
     all_chunks = []  # [(speaker_name, chunk_text), ...]
     for spk_name, seg_text in grouped:
-        text_chunks = split_text_into_chunks(seg_text)
+        text_chunks = split_text_into_chunks(seg_text, max_chars=chunk_size)
         for chunk in text_chunks:
             all_chunks.append((spk_name, chunk))
 
@@ -636,6 +637,22 @@ HTML_PAGE = """<!DOCTYPE html>
       <label>Top-P</label>
       <input type="number" id="top_p" value="0.9" min="0.1" max="1.0" step="0.05">
     </div>
+    <div class="control-group">
+      <label>Chunk</label>
+      <select id="chunk_size">
+        <option value="300">300</option>
+        <option value="500" selected>500</option>
+        <option value="800">800</option>
+        <option value="1200">1200</option>
+        <option value="99999">No limit</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="controls" style="margin-top:8px;">
+    <label style="display:flex; align-items:center; gap:6px; font-size:0.85rem; color:#aaa; cursor:pointer;">
+      <input type="checkbox" id="usePreset"> Storytelling voice (Willow + [storytelling])
+    </label>
   </div>
 
   <div class="hint">
@@ -931,8 +948,21 @@ function audioBufferToWav(buffer) {
 }
 
 async function speak() {
-  const text = document.getElementById('text').value.trim();
+  let text = document.getElementById('text').value.trim();
   if (!text) return;
+
+  const preset = document.getElementById('usePreset').checked;
+  let speakerVal = parseInt(document.getElementById('speaker').value);
+
+  if (preset) {
+    // Find Willow's speaker ID
+    const willowId = Object.entries(speakers).find(([k,v]) => v.toLowerCase() === 'willow');
+    if (willowId) speakerVal = parseInt(willowId[0]);
+    // Prepend storytelling tag if not already present
+    if (!text.toLowerCase().includes('[storytelling]')) {
+      text = '[storytelling] ' + text;
+    }
+  }
 
   const btn = document.getElementById('speakBtn');
   const status = document.getElementById('status');
@@ -942,7 +972,8 @@ async function speak() {
   status.textContent = 'Generating speech...';
 
   const t0 = performance.now();
-  const useStream = text.length > 200;
+  const chunkSize = parseInt(document.getElementById('chunk_size').value);
+  const useStream = text.length > 200 && chunkSize < 99999;
 
   try {
     if (useStream) {
@@ -958,10 +989,11 @@ async function speak() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           text: text,
-          speaker: parseInt(document.getElementById('speaker').value),
+          speaker: speakerVal,
           temperature: parseFloat(document.getElementById('temperature').value),
           top_p: parseFloat(document.getElementById('top_p').value),
           stream: true,
+          chunk_size: parseInt(document.getElementById('chunk_size').value),
         })
       });
 
@@ -1053,7 +1085,7 @@ async function speak() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           text: text,
-          speaker: parseInt(document.getElementById('speaker').value),
+          speaker: speakerVal,
           temperature: parseFloat(document.getElementById('temperature').value),
           top_p: parseFloat(document.getElementById('top_p').value),
         })
@@ -1129,18 +1161,21 @@ document.getElementById('text').addEventListener('keydown', function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') speak();
 });
 
-document.getElementById('text').addEventListener('input', function() {
-  const len = this.value.trim().length;
+function updateChunkInfo() {
+  const len = document.getElementById('text').value.trim().length;
   const info = document.getElementById('chunkInfo');
   if (len === 0) { info.textContent = ''; return; }
-  const willStream = len > 200;
+  const chunkSize = parseInt(document.getElementById('chunk_size').value);
+  const willStream = len > 200 && chunkSize < 99999;
   if (willStream) {
-    const est = Math.ceil(len / 500);
+    const est = Math.ceil(len / chunkSize);
     info.textContent = len + ' chars \u2014 ~' + est + ' chunk' + (est > 1 ? 's' : '') + ' (streaming)';
   } else {
-    info.textContent = len + ' chars';
+    info.textContent = len + ' chars' + (chunkSize >= 99999 ? ' (no chunking)' : '');
   }
-});
+}
+document.getElementById('text').addEventListener('input', updateChunkInfo);
+document.getElementById('chunk_size').addEventListener('change', updateChunkInfo);
 
 // --- Download helpers ---
 const dlIcon = '<svg viewBox="0 0 16 16"><path d="M8 12l-4-4h2.5V2h3v6H12L8 12zm-6 2h12v1.5H2V14z"/></svg>';
@@ -1601,7 +1636,7 @@ async def tts_api(body: TTSRequest):
                     t0 = time.time()
                     all_wav = bytearray()
                     for idx, total, wav_bytes in generate_audio_chunked(
-                        text, body.speaker, body.temperature, body.top_p, body.top_k
+                        text, body.speaker, body.temperature, body.top_p, body.top_k, body.chunk_size
                     ):
                         all_wav.extend(wav_bytes)
                         b64 = base64.b64encode(wav_bytes).decode()
