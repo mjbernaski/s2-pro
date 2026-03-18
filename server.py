@@ -145,7 +145,7 @@ def parse_speaker_segments(text, default_speaker=0):
     return segments
 
 
-def split_text_into_chunks(text, max_chars=250):
+def split_text_into_chunks(text, max_chars=500):
     """Split text into chunks at sentence boundaries for streaming generation.
 
     Tries to split at sentence-ending punctuation (. ! ? ; :), falling back
@@ -411,15 +411,29 @@ def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30
 
     total = len(all_chunks)
 
-    for idx, (spk_name, chunk_text) in enumerate(all_chunks):
-        prompt_text, prompt_tokens = load_voice_reference(spk_name)
+    # Track previous chunk's codes per speaker for voice consistency
+    prev_codes_by_speaker = {}  # speaker_name -> (text, codes)
 
-        if prompt_tokens is not None:
-            ref_texts = [prompt_text or ""]
-            ref_tokens = [prompt_tokens]
+    for idx, (spk_name, chunk_text) in enumerate(all_chunks):
+        # Start with voice clone reference if available
+        prompt_text_val, prompt_tokens_val = load_voice_reference(spk_name)
+
+        if prompt_tokens_val is not None:
+            ref_texts = [prompt_text_val or ""]
+            ref_tokens = [prompt_tokens_val]
         else:
             ref_texts = None
             ref_tokens = None
+
+        # Layer on previous chunk's codes for voice continuity
+        if spk_name in prev_codes_by_speaker:
+            prev_text, prev_tok = prev_codes_by_speaker[spk_name]
+            if ref_texts is None:
+                ref_texts = [prev_text]
+                ref_tokens = [prev_tok]
+            else:
+                ref_texts.append(prev_text)
+                ref_tokens.append(prev_tok)
 
         tagged_text = f"<|speaker:0|>{chunk_text}"
 
@@ -447,6 +461,13 @@ def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30
 
         if seg_codes:
             codes = torch.cat(seg_codes, dim=1)
+
+            # Keep last ~3 seconds of codes as reference for next chunk
+            # (~21 Hz frame rate, so ~63 frames = 3 seconds)
+            max_ref_frames = 63
+            ref_codes = codes[:, -max_ref_frames:] if codes.shape[1] > max_ref_frames else codes
+            prev_codes_by_speaker[spk_name] = (chunk_text[-80:], ref_codes)
+
             audio = decode_to_audio(codes.to("cpu"), _codec)
 
             buf = io.BytesIO()
@@ -1114,7 +1135,7 @@ document.getElementById('text').addEventListener('input', function() {
   if (len === 0) { info.textContent = ''; return; }
   const willStream = len > 200;
   if (willStream) {
-    const est = Math.ceil(len / 250);
+    const est = Math.ceil(len / 500);
     info.textContent = len + ' chars \u2014 ~' + est + ' chunk' + (est > 1 ? 's' : '') + ' (streaming)';
   } else {
     info.textContent = len + ' chars';
@@ -1552,7 +1573,7 @@ def _auto_save_audio(wav_bytes, text):
     # Generate filename from timestamp and text snippet
     ts = time.strftime("%Y%m%d_%H%M%S")
     # Clean text for filename: take first 40 chars, remove special chars
-    snippet = re.sub(r'[{}\[\]<>|\\/:*?"\']+', '', text[:40]).strip().replace(' ', '_')
+    snippet = re.sub(r'[{}\[\]<>|\\/:*?"\'\n\r\t]+', '', text[:40]).strip().replace(' ', '_')
     if not snippet:
         snippet = "speech"
     filename = f"{ts}_{snippet}.wav"
