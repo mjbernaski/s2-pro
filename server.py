@@ -39,7 +39,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, FileResponse, StreamingResponse
 import uvicorn
 
 # --- Audio Save Settings ---
@@ -145,6 +145,54 @@ def parse_speaker_segments(text, default_speaker=0):
     return segments
 
 
+def split_text_into_chunks(text, max_chars=250):
+    """Split text into chunks at sentence boundaries for streaming generation.
+
+    Tries to split at sentence-ending punctuation (. ! ? ; :), falling back
+    to commas, then to hard splits at max_chars.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining.strip())
+            break
+
+        # Try to find a sentence boundary within max_chars
+        best_split = -1
+        for sep in ['. ', '! ', '? ', '; ', ': ']:
+            idx = remaining.rfind(sep, 0, max_chars)
+            if idx > best_split:
+                best_split = idx + len(sep) - 1  # include the punctuation
+
+        # Fall back to comma
+        if best_split < 20:
+            idx = remaining.rfind(', ', 0, max_chars)
+            if idx > 20:
+                best_split = idx + 1
+
+        # Fall back to space
+        if best_split < 20:
+            idx = remaining.rfind(' ', 0, max_chars)
+            if idx > 20:
+                best_split = idx
+
+        # Hard split as last resort
+        if best_split < 20:
+            best_split = max_chars
+
+        chunk = remaining[:best_split].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[best_split:].strip()
+
+    return [c for c in chunks if c]
+
+
 # --- Voice Reference Cache ---
 _voice_cache = {}  # speaker_name_lower -> (prompt_text, prompt_tokens) or None
 
@@ -212,6 +260,7 @@ class TTSRequest(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 30
+    stream: bool = False
 
 app = FastAPI(title="Fish Audio S2 Pro TTS", version="1.0.0")
 
@@ -332,6 +381,79 @@ def generate_audio(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
     return buf.getvalue()
 
 
+def generate_audio_chunked(text, speaker=0, temperature=0.7, top_p=0.9, top_k=30):
+    """Generator that yields (chunk_index, total_chunks, wav_bytes) for each text chunk."""
+    import torch
+    import numpy as np
+    import soundfile as sf
+    from fish_speech.models.text2semantic.inference import (
+        generate_long,
+        decode_to_audio,
+    )
+
+    # Parse speaker segments, then split long text within each segment
+    segments = parse_speaker_segments(text, default_speaker=speaker)
+
+    # Group consecutive segments by same speaker
+    grouped = []
+    for spk, content in segments:
+        if grouped and grouped[-1][0] == spk:
+            grouped[-1] = (spk, grouped[-1][1] + " " + content)
+        else:
+            grouped.append((spk, content))
+
+    # Expand each segment into text chunks
+    all_chunks = []  # [(speaker_name, chunk_text), ...]
+    for spk_name, seg_text in grouped:
+        text_chunks = split_text_into_chunks(seg_text)
+        for chunk in text_chunks:
+            all_chunks.append((spk_name, chunk))
+
+    total = len(all_chunks)
+
+    for idx, (spk_name, chunk_text) in enumerate(all_chunks):
+        prompt_text, prompt_tokens = load_voice_reference(spk_name)
+
+        if prompt_tokens is not None:
+            ref_texts = [prompt_text or ""]
+            ref_tokens = [prompt_tokens]
+        else:
+            ref_texts = None
+            ref_tokens = None
+
+        tagged_text = f"<|speaker:0|>{chunk_text}"
+
+        seg_codes = []
+        for response in generate_long(
+            model=_model,
+            device=_device,
+            decode_one_token=_decode_one_token,
+            text=tagged_text,
+            num_samples=1,
+            max_new_tokens=0,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            compile=False,
+            iterative_prompt=True,
+            chunk_length=300,
+            prompt_text=ref_texts,
+            prompt_tokens=ref_tokens,
+        ):
+            if response.action == "sample":
+                seg_codes.append(response.codes)
+            elif response.action == "next":
+                break
+
+        if seg_codes:
+            codes = torch.cat(seg_codes, dim=1)
+            audio = decode_to_audio(codes.to("cpu"), _codec)
+
+            buf = io.BytesIO()
+            sf.write(buf, audio.float().numpy(), _codec.sample_rate, format="WAV")
+            yield idx, total, buf.getvalue()
+
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -346,7 +468,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .container { max-width: 700px; width: 100%; }
   h1 { font-size: 1.5rem; margin-bottom: 8px; color: #fff; }
   .subtitle { color: #888; margin-bottom: 24px; font-size: 0.9rem; }
-  textarea { width: 100%; height: 140px; padding: 12px; border: 1px solid #333;
+  textarea { width: 100%; height: 260px; padding: 12px; border: 1px solid #333;
              border-radius: 8px; background: #1a1a1a; color: #e0e0e0;
              font-size: 1rem; resize: vertical; font-family: inherit; }
   textarea:focus { outline: none; border-color: #4a9eff; }
@@ -466,7 +588,13 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
   <p class="subtitle">Text-to-Speech &mdash; multi-speaker support</p>
 
-  <textarea id="text" placeholder="{Aria} Hello there! {River} How are you today?&#10;&#10;Or just type plain text for single-speaker mode."></textarea>
+  <div style="position: relative;">
+    <textarea id="text"></textarea>
+    <button onclick="document.getElementById('text').value=''; document.getElementById('chunkInfo').textContent='';"
+            style="position:absolute; top:8px; right:8px; background:#333; color:#888; border:1px solid #444;
+                   border-radius:4px; padding:2px 8px; font-size:0.75rem; cursor:pointer;">Clear</button>
+    <div id="chunkInfo" style="font-size:0.75rem; color:#666; margin-top:4px;"></div>
+  </div>
 
   <div class="speaker-tags" id="speakerTagsSection">
     <div class="label">Insert speaker:</div>
@@ -713,6 +841,74 @@ async function testSpeaker(id) {
   }
 }
 
+// Decode base64 WAV to AudioBuffer
+async function decodeWavBase64(audioCtx, b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return await audioCtx.decodeAudioData(bytes.buffer);
+}
+
+// Concatenate multiple AudioBuffers into one
+function concatAudioBuffers(audioCtx, buffers) {
+  if (buffers.length === 0) return null;
+  if (buffers.length === 1) return buffers[0];
+  const totalLength = buffers.reduce((sum, b) => sum + b.length, 0);
+  const result = audioCtx.createBuffer(
+    buffers[0].numberOfChannels, totalLength, buffers[0].sampleRate
+  );
+  let offset = 0;
+  for (const buf of buffers) {
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+      result.getChannelData(ch).set(buf.getChannelData(ch), offset);
+    }
+    offset += buf.length;
+  }
+  return result;
+}
+
+// Convert AudioBuffer to WAV Blob for download/history
+function audioBufferToWav(buffer) {
+  const numCh = buffer.numberOfChannels;
+  const sr = buffer.sampleRate;
+  const format = 1; // PCM
+  const bitsPerSample = 16;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockAlign = numCh * bytesPerSample;
+  const dataSize = buffer.length * blockAlign;
+  const headerSize = 44;
+  const arrayBuf = new ArrayBuffer(headerSize + dataSize);
+  const view = new DataView(arrayBuf);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, format, true);
+  view.setUint16(22, numCh, true);
+  view.setUint32(24, sr, true);
+  view.setUint32(28, sr * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset2 = 44;
+  for (let i = 0; i < buffer.length; i++) {
+    for (let ch = 0; ch < numCh; ch++) {
+      let sample = buffer.getChannelData(ch)[i];
+      sample = Math.max(-1, Math.min(1, sample));
+      view.setInt16(offset2, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+      offset2 += 2;
+    }
+  }
+  return new Blob([arrayBuf], {type: 'audio/wav'});
+}
+
 async function speak() {
   const text = document.getElementById('text').value.trim();
   if (!text) return;
@@ -725,74 +921,179 @@ async function speak() {
   status.textContent = 'Generating speech...';
 
   const t0 = performance.now();
+  const useStream = text.length > 200;
 
   try {
-    const resp = await fetch('/v1/tts', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        text: text,
-        speaker: parseInt(document.getElementById('speaker').value),
-        temperature: parseFloat(document.getElementById('temperature').value),
-        top_p: parseFloat(document.getElementById('top_p').value),
-      })
-    });
+    if (useStream) {
+      // Streaming mode: play chunks as they arrive
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const chunkBuffers = [];
+      let nextPlayTime = audioCtx.currentTime;
+      const container = document.getElementById('audioContainer');
+      container.innerHTML = '<div class="status">Streaming audio...</div>';
 
-    if (!resp.ok) {
-      const err = await resp.json();
-      throw new Error(err.detail || 'Generation failed');
+      const resp = await fetch('/v1/tts', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          text: text,
+          speaker: parseInt(document.getElementById('speaker').value),
+          temperature: parseFloat(document.getElementById('temperature').value),
+          top_p: parseFloat(document.getElementById('top_p').value),
+          stream: true,
+        })
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || 'Generation failed');
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      async function handleSSELine(line) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data: ')) return;
+        const event = JSON.parse(trimmed.slice(6));
+        status.textContent = 'Generating chunk ' + (event.chunk + 1) + '/' + event.total + '...';
+        btn.textContent = (event.chunk + 1) + '/' + event.total;
+        const audioBuf = await decodeWavBase64(audioCtx, event.audio);
+        chunkBuffers.push(audioBuf);
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(audioCtx.destination);
+        if (nextPlayTime < audioCtx.currentTime) nextPlayTime = audioCtx.currentTime;
+        source.start(nextPlayTime);
+        nextPlayTime += audioBuf.duration;
+      }
+
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        const parts = buffer.split('\\n');
+        buffer = parts.pop();
+        for (const part of parts) await handleSSELine(part);
+      }
+      // Flush any remaining data in buffer
+      if (buffer.trim()) await handleSSELine(buffer);
+
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      status.textContent = 'Generated in ' + elapsed + 's (' + chunkBuffers.length + ' chunks)';
+
+      // Build combined audio for controls and download
+      const combined = concatAudioBuffers(audioCtx, chunkBuffers);
+      if (combined) {
+        const wavBlob = audioBufferToWav(combined);
+        const url = URL.createObjectURL(wavBlob);
+        const fname = 'speech.wav';
+        container.innerHTML = '<audio controls src="' + url + '"></audio>';
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'dl-btn';
+        dlBtn.innerHTML = dlIcon + ' Download';
+        dlBtn.onclick = function() { downloadBlob(url, fname); };
+        container.appendChild(dlBtn);
+
+        // Add to history
+        const historySection = document.getElementById('historySection');
+        historySection.style.display = 'block';
+        const historyList = document.getElementById('historyList');
+        const item = document.createElement('div');
+        item.className = 'history-item';
+        const itemText = document.createElement('div');
+        itemText.className = 'text';
+        itemText.textContent = text;
+        const itemMeta = document.createElement('div');
+        itemMeta.className = 'meta';
+        itemMeta.textContent = elapsed + 's (' + chunkBuffers.length + ' chunks) \u2014 ' + new Date().toLocaleTimeString();
+        const itemAudio = document.createElement('audio');
+        itemAudio.controls = true;
+        itemAudio.src = url;
+        const itemActions = document.createElement('div');
+        itemActions.className = 'item-actions';
+        const itemDlBtn = document.createElement('button');
+        itemDlBtn.className = 'dl-btn';
+        itemDlBtn.innerHTML = dlIcon + ' Download';
+        itemDlBtn.onclick = function() { downloadBlob(url, fname); };
+        itemActions.appendChild(itemDlBtn);
+        item.appendChild(itemText);
+        item.appendChild(itemMeta);
+        item.appendChild(itemAudio);
+        item.appendChild(itemActions);
+        historyList.insertBefore(item, historyList.firstChild);
+      }
+
+    } else {
+      // Short text: use non-streaming mode
+      const resp = await fetch('/v1/tts', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          text: text,
+          speaker: parseInt(document.getElementById('speaker').value),
+          temperature: parseFloat(document.getElementById('temperature').value),
+          top_p: parseFloat(document.getElementById('top_p').value),
+        })
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.detail || 'Generation failed');
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      const savedFilename = resp.headers.get('X-Saved-Filename') || '';
+
+      const fname = savedFilename || 'speech.wav';
+      const container = document.getElementById('audioContainer');
+      container.innerHTML = '<audio controls autoplay src="' + url + '"></audio>';
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'dl-btn';
+      dlBtn.innerHTML = dlIcon + ' Download';
+      dlBtn.onclick = function() { downloadBlob(url, fname); };
+      container.appendChild(dlBtn);
+      if (savedFilename) {
+        const indicator = document.createElement('span');
+        indicator.className = 'save-indicator';
+        indicator.textContent = 'Saved: ' + savedFilename;
+        container.appendChild(document.createTextNode(' '));
+        container.appendChild(indicator);
+      }
+
+      status.textContent = 'Generated in ' + elapsed + 's';
+
+      const historySection = document.getElementById('historySection');
+      historySection.style.display = 'block';
+      const historyList = document.getElementById('historyList');
+      const item = document.createElement('div');
+      item.className = 'history-item';
+      const itemText = document.createElement('div');
+      itemText.className = 'text';
+      itemText.textContent = text;
+      const itemMeta = document.createElement('div');
+      itemMeta.className = 'meta';
+      itemMeta.textContent = elapsed + 's \u2014 ' + new Date().toLocaleTimeString() +
+        (savedFilename ? ' \u2014 ' + savedFilename : '');
+      const itemAudio = document.createElement('audio');
+      itemAudio.controls = true;
+      itemAudio.src = url;
+      const itemActions = document.createElement('div');
+      itemActions.className = 'item-actions';
+      const itemDlBtn = document.createElement('button');
+      itemDlBtn.className = 'dl-btn';
+      itemDlBtn.innerHTML = dlIcon + ' Download';
+      itemDlBtn.onclick = function() { downloadBlob(url, fname); };
+      itemActions.appendChild(itemDlBtn);
+      item.appendChild(itemText);
+      item.appendChild(itemMeta);
+      item.appendChild(itemAudio);
+      item.appendChild(itemActions);
+      historyList.insertBefore(item, historyList.firstChild);
     }
-
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-    const savedFilename = resp.headers.get('X-Saved-Filename') || '';
-
-    const fname = savedFilename || 'speech.wav';
-    const container = document.getElementById('audioContainer');
-    container.innerHTML = '<audio controls autoplay src="' + url + '"></audio>';
-    const dlBtn = document.createElement('button');
-    dlBtn.className = 'dl-btn';
-    dlBtn.innerHTML = dlIcon + ' Download';
-    dlBtn.onclick = function() { downloadBlob(url, fname); };
-    container.appendChild(dlBtn);
-    if (savedFilename) {
-      const indicator = document.createElement('span');
-      indicator.className = 'save-indicator';
-      indicator.textContent = 'Saved: ' + savedFilename;
-      container.appendChild(document.createTextNode(' '));
-      container.appendChild(indicator);
-    }
-
-    status.textContent = 'Generated in ' + elapsed + 's';
-
-    const historySection = document.getElementById('historySection');
-    historySection.style.display = 'block';
-    const historyList = document.getElementById('historyList');
-    const item = document.createElement('div');
-    item.className = 'history-item';
-    const itemText = document.createElement('div');
-    itemText.className = 'text';
-    itemText.textContent = text;
-    const itemMeta = document.createElement('div');
-    itemMeta.className = 'meta';
-    itemMeta.textContent = elapsed + 's \u2014 ' + new Date().toLocaleTimeString() +
-      (savedFilename ? ' \u2014 ' + savedFilename : '');
-    const itemAudio = document.createElement('audio');
-    itemAudio.controls = true;
-    itemAudio.src = url;
-    const itemActions = document.createElement('div');
-    itemActions.className = 'item-actions';
-    const itemDlBtn = document.createElement('button');
-    itemDlBtn.className = 'dl-btn';
-    itemDlBtn.innerHTML = dlIcon + ' Download';
-    itemDlBtn.onclick = function() { downloadBlob(url, fname); };
-    itemActions.appendChild(itemDlBtn);
-    item.appendChild(itemText);
-    item.appendChild(itemMeta);
-    item.appendChild(itemAudio);
-    item.appendChild(itemActions);
-    historyList.insertBefore(item, historyList.firstChild);
 
   } catch (e) {
     status.className = 'status error';
@@ -805,6 +1106,19 @@ async function speak() {
 
 document.getElementById('text').addEventListener('keydown', function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') speak();
+});
+
+document.getElementById('text').addEventListener('input', function() {
+  const len = this.value.trim().length;
+  const info = document.getElementById('chunkInfo');
+  if (len === 0) { info.textContent = ''; return; }
+  const willStream = len > 200;
+  if (willStream) {
+    const est = Math.ceil(len / 250);
+    info.textContent = len + ' chars \u2014 ~' + est + ' chunk' + (est > 1 ? 's' : '') + ' (streaming)';
+  } else {
+    info.textContent = len + ' chars';
+  }
 });
 
 // --- Download helpers ---
@@ -1146,6 +1460,7 @@ HELP_PAGE = """<!DOCTYPE html>
     <tr><td><code>temperature</code></td><td>float</td><td>0.7</td><td>Sampling temperature (0.1&ndash;2.0). Higher = more varied.</td></tr>
     <tr><td><code>top_p</code></td><td>float</td><td>0.9</td><td>Nucleus sampling threshold (0.1&ndash;1.0).</td></tr>
     <tr><td><code>top_k</code></td><td>int</td><td>30</td><td>Top-K sampling limit.</td></tr>
+    <tr><td><code>stream</code></td><td>bool</td><td>false</td><td>If true, returns Server-Sent Events with chunked audio (base64 WAV per chunk).</td></tr>
   </table>
 
   <pre><code># Single speaker
@@ -1158,9 +1473,16 @@ curl -X POST http://localhost:8880/v1/tts \\
 curl -X POST http://localhost:8880/v1/tts \\
   -H "Content-Type: application/json" \\
   -d '{"text": "{Aria} Hi! {River} Hey there!"}' \\
-  -o dialogue.wav</code></pre>
+  -o dialogue.wav
 
-  <p>Response headers include <code>X-Generation-Time</code> with elapsed seconds.</p>
+# Streaming (SSE) - long text chunked into sentence-level pieces
+curl -N -X POST http://localhost:8880/v1/tts \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "A very long text...", "stream": true}'
+# Returns: data: {"chunk":0,"total":3,"audio":"<base64 wav>","done":false}</code></pre>
+
+  <p>Response headers include <code>X-Generation-Time</code> with elapsed seconds.
+     The web UI automatically uses streaming for text longer than 200 characters.</p>
 
   <h3>GET /v1/speakers</h3>
   <p>Returns the current speaker name mapping as JSON (<code>{"0": "Aria", "1": "River", ...}</code>).</p>
@@ -1241,10 +1563,51 @@ def _auto_save_audio(wav_bytes, text):
 
 @app.post("/v1/tts")
 async def tts_api(body: TTSRequest):
+    import base64
+
     text = body.text.strip()
     if not text:
         return JSONResponse({"detail": "text is required"}, status_code=400)
 
+    if body.stream:
+        # Streaming mode: return Server-Sent Events with audio chunks
+        async def _stream_events():
+            loop = asyncio.get_event_loop()
+            q = asyncio.Queue()
+
+            def _generate():
+                with _lock:
+                    t0 = time.time()
+                    all_wav = bytearray()
+                    for idx, total, wav_bytes in generate_audio_chunked(
+                        text, body.speaker, body.temperature, body.top_p, body.top_k
+                    ):
+                        all_wav.extend(wav_bytes)
+                        b64 = base64.b64encode(wav_bytes).decode()
+                        loop.call_soon_threadsafe(q.put_nowait, {
+                            "chunk": idx,
+                            "total": total,
+                            "audio": b64,
+                            "done": idx == total - 1,
+                        })
+                        elapsed = time.time() - t0
+                        print(f"  Chunk {idx+1}/{total} generated ({len(wav_bytes)} bytes, {elapsed:.1f}s elapsed)")
+                    # Auto-save the combined audio
+                    if all_wav:
+                        _auto_save_audio(bytes(all_wav), text)
+                    loop.call_soon_threadsafe(q.put_nowait, None)
+
+            asyncio.ensure_future(asyncio.to_thread(_generate))
+
+            while True:
+                event = await q.get()
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+
+        return StreamingResponse(_stream_events(), media_type="text/event-stream")
+
+    # Non-streaming mode: return full WAV
     def _run():
         with _lock:
             return generate_audio(text, body.speaker, body.temperature, body.top_p, body.top_k)
