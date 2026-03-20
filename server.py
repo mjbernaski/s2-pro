@@ -947,6 +947,8 @@ function audioBufferToWav(buffer) {
   return new Blob([arrayBuf], {type: 'audio/wav'});
 }
 
+let _activeAbort = null;
+
 async function speak() {
   let text = document.getElementById('text').value.trim();
   if (!text) return;
@@ -971,6 +973,11 @@ async function speak() {
   status.className = 'status';
   status.textContent = 'Generating speech...';
 
+  // Abort any previous in-flight request
+  if (_activeAbort) _activeAbort.abort();
+  _activeAbort = new AbortController();
+  const signal = _activeAbort.signal;
+
   const t0 = performance.now();
   const chunkSize = parseInt(document.getElementById('chunk_size').value);
   const useStream = text.length > 200 && chunkSize < 99999;
@@ -987,6 +994,7 @@ async function speak() {
       const resp = await fetch('/v1/tts', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
+        signal: signal,
         body: JSON.stringify({
           text: text,
           speaker: speakerVal,
@@ -1083,6 +1091,7 @@ async function speak() {
       const resp = await fetch('/v1/tts', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
+        signal: signal,
         body: JSON.stringify({
           text: text,
           speaker: speakerVal,
@@ -1149,9 +1158,16 @@ async function speak() {
     }
 
   } catch (e) {
+    if (e.name === 'AbortError') return; // user triggered a new request
+    const isIOSNetworkDrop = e.message === 'Load failed' || e.message === 'The operation was aborted.' || e.message === 'Failed to fetch';
     status.className = 'status error';
-    status.textContent = 'Error: ' + e.message;
+    if (isIOSNetworkDrop) {
+      status.innerHTML = 'Connection lost (page was suspended). <button onclick="speak()" style="margin-left:8px;padding:4px 12px;border-radius:6px;border:1px solid #888;cursor:pointer;">Retry</button>';
+    } else {
+      status.textContent = 'Error: ' + e.message;
+    }
   } finally {
+    _activeAbort = null;
     btn.disabled = false;
     btn.textContent = 'Speak';
   }
@@ -1159,6 +1175,14 @@ async function speak() {
 
 document.getElementById('text').addEventListener('keydown', function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') speak();
+});
+
+// Resume AudioContext on iOS when returning to the page
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'visible') {
+    var audios = document.querySelectorAll('audio');
+    audios.forEach(function(a) { a.load(); });
+  }
 });
 
 function updateChunkInfo() {
